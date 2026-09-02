@@ -1,0 +1,145 @@
+name: Build client release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric client version (for example, 31 or 31.1)
+        required: true
+        type: string
+      release_notes:
+        description: Short text shown in the in-app update banner
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: client-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, build, sign, and publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: source
+    env:
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      PORTABLE_VERSION: ${{ inputs.version }}
+      PORTABLE_INCLUDE_ENV: "false"
+
+    steps:
+      - name: Check out the private source read-only
+        uses: actions/checkout@v4
+        with:
+          repository: CynGames/jurasauria-nest
+          ref: master
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Validate release inputs and secrets
+        shell: pwsh
+        env:
+          UPDATE_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ($env:PORTABLE_VERSION -notmatch '^\d+(\.\d+)*$') {
+            throw 'Version must contain only numeric components, such as 31 or 31.1.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_PRIVATE_KEY)) {
+            throw 'Repository secret UPDATE_SIGNING_PRIVATE_KEY is not configured.'
+          }
+          if (-not (Test-Path -LiteralPath 'config/update-public-key.pem' -PathType Leaf)) {
+            throw 'Tracked update verification key config/update-public-key.pem is missing.'
+          }
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare verified portable tools
+        shell: pwsh
+        run: ./scripts/prepare-portable-tools.ps1
+
+      - name: Build workspace packages for tests
+        run: pnpm --filter @jurasauria/shared build && pnpm --filter @jurasauria/db build
+
+      - name: Run API tests
+        run: pnpm --filter api exec jest --runInBand
+
+      - name: Run release tooling tests
+        run: pnpm test:release
+
+      - name: Test portable replacement and rollback preservation
+        run: pnpm test:updater
+
+      - name: Check updater API lint
+        run: pnpm --filter api exec eslint "src/core/updates/**/*.ts" --max-warnings=0
+
+      - name: Check web lint
+        run: pnpm --filter web exec eslint . --max-warnings=0
+
+      - name: Build credential-free portable update
+        shell: cmd
+        run: scripts\build-portable.bat
+
+      - name: Verify package and create signed manifest
+        shell: pwsh
+        env:
+          UPDATE_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+          UPDATE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          $source = "JuraSauriaV$env:PORTABLE_VERSION.zip"
+          $asset = "JuraSauriaV$env:PORTABLE_VERSION-update.zip"
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Portable build did not produce $source."
+          }
+          Move-Item -LiteralPath $source -Destination $asset
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $asset))
+          try {
+            $secretEntry = $zip.Entries | Where-Object { $_.FullName -match '(^|/)\.env$' }
+            if ($secretEntry) { throw 'Public update archive unexpectedly contains .env.' }
+          } finally {
+            $zip.Dispose()
+          }
+
+          $env:UPDATE_ARTIFACT_PATH = $asset
+          $env:UPDATE_ASSET_URL = "https://github.com/$env:RELEASE_REPOSITORY/releases/download/v$env:PORTABLE_VERSION/$asset"
+          $env:UPDATE_VERSION = $env:PORTABLE_VERSION
+          $env:UPDATE_MANIFEST_PATH = 'latest.json'
+          node scripts/release/create-update-manifest.mjs
+
+      - name: Publish dedicated client release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          $tag = "v$env:PORTABLE_VERSION"
+          $asset = "JuraSauriaV$env:PORTABLE_VERSION-update.zip"
+          gh release view $tag --repo $env:RELEASE_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists." }
+          $notes = $env:RELEASE_NOTES
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = "JuraSauria client V$env:PORTABLE_VERSION"
+          }
+          gh release create $tag $asset latest.json `
+            --repo $env:RELEASE_REPOSITORY `
+            --title "JuraSauria V$env:PORTABLE_VERSION" `
+            --notes $notes
